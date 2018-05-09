@@ -1,0 +1,576 @@
+---
+title: "Predictive Modeling: Would You Like To See Your Date Again?"
+output: html_document
+urlcolor: blue
+---
+========================================================
+### Name: Rajnish Yadav
+
+```{r setup, include=FALSE}
+#DON'T MODIFY THIS CHUNK!
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE, tidy = TRUE, tidy.opts=list(width.cutoff=50))
+```
+
+```{r}
+#Put all necessary libraries here
+library(caret)
+library(tidyr)
+library(broom)
+library(rpart)
+library(partykit)
+library(caretEnsemble)
+library(ggplot2)
+library(kernlab)
+library(randomForest)
+```
+
+We will build logistic regression models, penalized logistic regression models, classification trees, support vector machines, bagged classification trees, random forests and stacked ensemble models.
+
+* We are going to analyze data from a speed dating study. These data were gathered from graduate students in speed dating events from 2002-2004 at Columbia University. During the events, the attendees would have a four minute "first date" with every other participant of the opposite sex. At the end of their four minutes, participants were asked if they would like to see their date again.
+    
+* To estimate the predictive accuracy rate of each model, use 10 fold repeated cross-validation with 5 repeats.
+
+* The fact that we have multiple observations per participant means the data are not independent. Run the data wrangling code below. It will randomly select a speed date for each participant so that the observations are (roughly) independent. I also filtered to only include the waves with the same experimental design.
+    
+**Modeling Goal**: To predict whether or not a participant decides that they want a second date.  This variable is given by `dec`. 
+
+```{r}
+#Read in Data
+library(readr)
+Speed_Dating_Data <- read_csv("~/DataScience/Statistics/Data/Speed Dating Data.csv")
+
+## Data wrangling
+library(dplyr)
+# Only one obs per person
+# Only people in waves with similar experimental designs
+set.seed(42209)
+Speed_Dating_Data <- Speed_Dating_Data %>%
+  group_by(iid) %>%
+  sample_n(1) %>%
+  filter(wave %in% c(1:4, 10, 11, 13:17)) %>%
+  ungroup()
+```
+
+Let's create a dataset that contains the following explanatory variables and the variable of interest. Change any classes that are incorrect.
+
+* Characteristics about the participant: `age, gender, race, field_cd, goal, date`
+* Characteristics about the partner: `race_o, age_o`
+* Joint characteristics: `samerace, int_corr`
+* Perception of partner from speed date (keep numeric): `attr, sinc, intel, fun, amb, shar, prob`
+
+```{r}
+speed_dating <- Speed_Dating_Data %>%
+  select(dec, age, gender, race, field_cd, goal, date, race_o, age_o, samerace, int_corr, attr, sinc, intel, fun, amb, shar, prob) %>%
+  na.omit() %>%
+  mutate(dec = factor(dec))
+speed_dating
+```
+
+Let's fit a logistic regression model.  
+
+```{r}
+# set up resampling options
+cv_opts <- trainControl(method = "repeatedcv", number = 10, repeats = 5)
+
+# build model 
+set.seed(3147)
+mod_log <- train(dec ~ ., data = speed_dating, method = "glm", family = "binomial", trControl = cv_opts)
+
+# predicted values
+pred1 <- predict(mod_log, data = speed_dating)
+
+# confusion matrix
+speed_dating$dec
+confusionMatrix(pred1, speed_dating$dec)
+
+```
+
+*********************************************************************************
+
+The predictive accuracy rate of the logistic regression model is 0.7957.
+
+*********************************************************************************
+
+Let's fit an elastic net logistic regression model.  We make sure to tune the hyper-parameters.
+
+```{r}
+# Set-up grid of possible hyper-parameter values
+lam <- c(5:10/100)
+alpha <- c(90:95/100)
+grd <- expand.grid(lambda = lam, alpha = alpha)
+
+# Build the model
+set.seed(3147)
+mod_enet <- train(dec ~ ., data = speed_dating, method = "glmnet", tuneGrid = grd,
+ trControl = cv_opts, standardize = TRUE, family = "binomial")
+
+mod_enet
+plot(mod_enet)
+```
+
+
+*********************************************************************************
+
+alpha = .92 implies that the tuned elastic net model would give 92% weight to lasso penalty and 8% weight to ridge penalty. This implies that there will be relatively few predictive variables. 
+
+The accuracy rate of the elastic net model is 0.8090116.
+
+*********************************************************************************
+
+Let's create and print a table of the variables selected by our final elastic net model.  
+
+```{r}
+final_mod_enet <- mod_enet$finalModel
+tidy(coef(final_mod_enet, s = mod_enet$bestTune$lambda))[, -2]
+```
+*********************************************************************************
+
+Only 4 variables were left- int_corr, attr, shar and prob. However, 'attr' and 'prob' have significantly more value than the rest of the variables. The subjects based most of their decision on how attractive 'attr' their partners were. They also put decent emphasis on 'prob'- how probable they thought their partner would say 'yes' for them.
+
+*********************************************************************************
+
+Let's build a classification tree.
+
+```{r}
+# Hyper-parameter grid
+grd <- data.frame(.cp = (2:6) * 0.01)
+# Train Classification Tree
+set.seed(3147)
+mod_tree <- train(dec ~ ., data = speed_dating, method = "rpart", tuneGrid = grd, trControl = cv_opts)
+plot(mod_tree)
+
+# Fit the tree
+mod_t <- rpart(dec ~ ., data = speed_dating, control =
+ rpart.control(cp = mod_tree$bestTune))
+
+```
+
+Let's plot the classification tree using the plotting function in the `partykit` package.   Interpret the plot.
+
+```{r}
+# Plot the tree
+plot(as.party(mod_t), gp = gpar(fontsize = 10))
+```
+
+*********************************************************************************
+
+If the 'attr' attractiveness of the partner is below 6.5, there is only a 20% probability that the person will want to go on a second date. However, if the 'attr' is more than 6.5 and the 'prob' (how probable the partner would say 'yes') is more than 4.5, there is over a 80% chance that the person will want to go on a second date. Similarly, if the 'attr' is more than 6.5 and the 'prob' is less than 4.5, there is only about 35% chance that the person will want to go on a second date.
+
+*********************************************************************************
+
+We can try to improve the models through wrangling the data to create better predictor variables.  Let's create the following predictors:
+
+* A predictor that gives the age difference between the participant and the partner. 
+* Create person specific standardized versions of the perception variables (`attr, sinc, intel, fun, amb, shar, prob`) to control for different definitions of these traits.  You will need to create these variables BEFORE sampling one row from each participant.
+
+```{r}
+# new dataset containing age difference predictor and standardized versions of the perception variables
+Speed_Dating_Data1 <- read_csv("~/DataScience/Statistics/Data/Speed Dating Data.csv")
+speed_dating1 <- Speed_Dating_Data1 %>%
+  group_by(iid) %>%
+  mutate(age_diff = abs(age - age_o)) %>%
+  mutate(std_attr = scale(attr),
+         std_sinc = scale(sinc),
+         std_intel = scale(intel),
+         std_fun = scale(fun),
+         std_amb = scale(amb),
+         std_shar = scale(shar),
+         std_prob = scale(prob)) %>%
+  sample_n(1) %>%
+  filter(wave %in% c(1:4, 10, 11, 13:17)) %>%
+  ungroup()
+  
+speed_dating1
+```
+
+Now swap `age_o` for `age_diff` and the standardized perception variables for the unstandardized perception variables and rebuild the three models (logistic, elastic-net logistic, and tree).
+
+```{r}
+# swap `age_o` for `age_diff` and the standardized perception variables for the unstandardized perception variables
+
+speed_dating2 <- speed_dating1 %>%
+  select(dec, age_diff, gender, race, field_cd, goal, date, race_o, samerace, int_corr, std_attr, std_sinc, std_intel, std_fun, std_amb, std_shar, std_prob) %>%
+  mutate(dec = factor(dec)) %>%
+  na.omit()
+
+speed_dating2
+```
+
+```{r}
+# logistic regression model
+
+# set up resampling options
+cv_opts <- trainControl(method = "repeatedcv", number = 10, repeats = 5)
+
+# build model 
+set.seed(3147)
+mod_log1 <- train(dec ~ ., data = speed_dating2, method = "glm", family = "binomial", trControl = cv_opts)
+
+# predicted values
+pred2 <- predict(mod_log1, data = speed_dating2)
+
+# confusion matrix
+speed_dating2$dec
+confusionMatrix(pred2, speed_dating2$dec)
+
+```
+
+```{r}
+# elastic net logistic regression model
+cv_opts <- trainControl(method = "repeatedcv", number = 10, repeats = 5)
+# Set-up grid of possible hyper-parameter values
+lam1 <- c(3:7/100)
+alpha1 <- c(60:70/100)
+grd1 <- expand.grid(lambda = lam1, alpha = alpha1)
+
+# Build the model
+set.seed(3147)
+mod_enet1 <- train(dec ~ ., data = speed_dating2, method = "glmnet", tuneGrid = grd1,
+ trControl = cv_opts, standardize = TRUE, family = "binomial")
+
+mod_enet1
+plot(mod_enet1)
+
+final_mod_enet1 <- mod_enet1$finalModel
+tidy(coef(final_mod_enet1, s = mod_enet1$bestTune$lambda))[, -2]
+
+```
+
+```{r}
+# build a classification tree
+
+# Hyper-parameter grid
+grd2 <- data.frame(.cp = (5:15) * 0.01)
+# Train Classification Tree
+set.seed(3147)
+mod_tree2 <- train(dec ~ ., data = speed_dating2, method = "rpart", tuneGrid = grd2, trControl = cv_opts)
+plot(mod_tree2)
+
+# Fit the tree
+mod_t2 <- rpart(dec ~ ., data = speed_dating2, control =
+ rpart.control(cp = mod_tree2$bestTune))
+
+```
+
+```{r}
+# Plot the tree
+plot(as.party(mod_t2), gp = gpar(fontsize = 10))
+```
+
+There are several other variables one could consider.  Let's swap out some (at least five) of the variables that proved less predictive in your initial models for some of the other variables. Then rebuild the three models (logistic, elastic-net logistic, and tree).
+
+```{r}
+#new dataset 
+speed_dating3 <- speed_dating1 %>%
+  select(dec, age, gender, race, imprelig, imprace, go_out, date, race_o, age_o, career_c, int_corr, std_attr, std_sinc, std_intel, std_fun, std_amb, std_shar, std_prob) %>%
+  na.omit() %>%
+  mutate(dec = factor(dec)) %>%
+  mutate(age_diff = abs(age - age_o)) %>%
+  select(-age_o)
+
+speed_dating3
+
+```
+
+```{r}
+# logistic regression model
+
+# set up resampling options
+cv_opts <- trainControl(method = "repeatedcv", number = 10, repeats = 5)
+
+# build model 
+set.seed(3147)
+mod_log2 <- train(dec ~ ., data = speed_dating3, method = "glm", family = "binomial", trControl = cv_opts)
+mod_log2
+# predicted values
+pred3 <- predict(mod_log2, data = speed_dating3)
+
+# confusion matrix 
+speed_dating3$dec
+confusionMatrix(pred3, speed_dating3$dec)
+```
+
+```{r}
+# elastic net logistic regression model
+
+# Set-up grid of possible hyper-parameter values
+lam2 <- c(20:50/100)
+alpha2 <- c(0:10/10)
+grd2 <- expand.grid(lambda = lam2, alpha = alpha2)
+
+# Build the model
+set.seed(9696)
+mod_enet2 <- train(dec ~ ., data = speed_dating3, method = "glmnet", tuneGrid = grd2,
+ trControl = cv_opts, standardize = TRUE, family = "binomial")
+
+mod_enet2
+plot(mod_enet2)
+
+final_mod_enet2 <- mod_enet2$finalModel
+tidy(coef(final_mod_enet2, s = mod_enet2$bestTune$lambda))[, -2]
+
+```
+
+```{r}
+# build a classification tree
+
+# Hyper-parameter grid
+grd3 <- data.frame(.cp = (1:10) /10)
+# Train Classification Tree
+set.seed(9696)
+mod_tree3 <- train(dec ~ ., data = speed_dating3, method = "rpart", tuneGrid = grd3, trControl = cv_opts)
+mod_tree3
+
+# Fit the tree
+mod_t3 <- rpart(dec ~ ., data = speed_dating3, control =
+ rpart.control(cp = mod_tree3$bestTune))
+```
+
+```{r}
+# Plot the tree
+plot(as.party(mod_t3), gp = gpar(fontsize = 10))
+```
+
+Its time to compare the predictive accuracy rates of our models.  Let's create a useful graphic to visualize the accuracy rates for all of the folds across 6 of our strongest models and construct a data table/frame of useful summary statistics.
+
+```{r}
+# Store results
+library(tidyr)
+results <- resamples(list(first_log = mod_log, second_log = mod_log1, third_log = mod_log2, first_enet = mod_enet, third_enet = mod_enet2, first_tree = mod_tree))$values %>%
+  select(contains("Accuracy")) %>% 
+  gather(key = "Model", value = "Accuracy")
+head(results, 25)
+```
+```{r}
+# Plot results
+ggplot(results, aes(x = Model, y = Accuracy, col = Model)) + geom_violin() + geom_point(alpha = 0.6) +
+  theme(legend.position="none") + 
+  theme(axis.text.x = element_text(angle=60, hjust=1))
+
+```
+
+*********************************************************************************
+
+The mean and median accuracy of the first elastic logistic regression and the first tree model we built is a lot higher (and almost identical) compared to the rest of the models. In contrast, the logistic regression models have the lowest mean and median accuracies. 
+
+```{r}
+results_summary <- results %>%
+  group_by(Model) %>%
+  summarise(Mean_Accuracy = mean(Accuracy),
+            Median_Accuracy = median(Accuracy),
+            Min_Accuracy  = min(Accuracy),
+            Max_Accuracy  = max(Accuracy))
+  
+results_summary
+
+```
+
+
+*********************************************************************************
+
+Let's recreate a dataset that contains the following explanatory variables and the variable of interest. Change any classes that are incorrect.  **We won't remove missing values.** (We will ontinue to leave out income.)
+
+* Characteristics about the participant: `age, gender, race, field_cd, goal, date`
+* Characteristics about the partner: `race_o, age_o`
+* Joint characteristics: `samerace, int_corr`
+* Perception of partner from speed date (keep numeric): `attr, sinc, intel, fun, amb, shar, prob`
+
+```{r, tidy = FALSE}
+speed_dating <- Speed_Dating_Data %>%
+  select(dec, age, gender, race, field_cd, goal, date, race_o, age_o, samerace, int_corr, attr, sinc, intel, fun, amb, shar, prob) %>%
+  mutate(dec = factor(dec), gender = factor(gender), samerace = factor(samerace))
+
+speed_dating
+```
+
+Let's rereate a data table that displays the level of missingness for each variable.
+
+```{r}
+glimpse(summarise_all(speed_dating, funs(sum(is.na(.)))))
+```
+
+For the categorical predictors, replace the NA with "No value".  In other words, make NA a category of the variable.
+
+```{r, tidy = FALSE}
+#You may have to convert variables from character vectors to factor vectors.
+speed_dating <- speed_dating %>%
+  mutate(race = ifelse(is.na(race),"No value", race)) %>%
+  mutate(field_cd = ifelse(is.na(field_cd),"No value", field_cd)) %>%
+  mutate(goal = ifelse(is.na(goal),"No value", goal)) %>%
+  mutate(date = ifelse(is.na(date),"No value", date)) %>%
+  mutate(race_o = ifelse(is.na(race_o),"No value", race_o)) %>%
+  mutate_if(is.character, as.factor)
+
+speed_dating
+```
+
+For the quantitative predictors, impute missing values using whichever method you want! Here I select 'medianImpute'. 
+
+```{r, tidy = FALSE}
+speed_dating_prequant <- preProcess(speed_dating, method = c("medianImpute"))
+speed_dating_all <- predict(speed_dating_prequant, speed_dating)
+speed_dating_all
+```
+
+Let's create a scatterplot of `attr` and `prob` with `dec` as the color of the dots. 
+
+```{r, tidy = FALSE}
+ggplot(speed_dating_all, aes(x = attr, y = prob, col = dec)) +
+  geom_jitter(size = 2, width = .25) +
+  labs(title = "Likelihood Of A Second Date Based On Key Attributes",
+       subtitle = "Source: Columbia Speed Dating Survey",
+       x = "How attractive is the other person",
+       y = "How probable is that the other person wants \n a second date (1 = low, 10 = high)") +
+  scale_color_manual(name = "Participant wants a \n second date?",
+                     labels = c("No", "Yes"),
+                     values = c("0" = "darkgoldenrod2",
+                                "1" = "deepskyblue3"))
+```
+
+*********************************************************************************
+
+Based on the above gittered scatterplot above, we can make some interesting observations: \newline
+If the participants rate their date below 5, there is extremely low chance of them wanting a second date with that person. Similarly, if the participants think that there is below 5 likelihood that the other person would also want to go on a second date with them, the participant will not want a second date with that person. We can see mostly blue points near the top right corner, which means that the participants will want a second date if they give their partners attractiveness scores of more than 6, and they think that their partner's likelihood of wanting a second date is more than 5. 
+
+*********************************************************************************
+
+Let's create two SVM models (`svmLinear` and `svmRadial`) using `attr` and `prob`.
+
+```{r}
+# SVM Example: Linear
+# Set-up CV options
+set.seed(3147)
+cv_opts <- trainControl(method = "cv", number = 10) # Range of values for hyper-parameter
+C <- c(2.6, 2.7, 2.8, 2.9, 3.0, 3.1)
+# Train Linear SVM model
+mod_svm_l <- train(dec ~ attr + prob, data = speed_dating_all, method = "svmLinear", preProc = c("center", "scale"), tuneGrid = data.frame(C), trControl = cv_opts)
+mod_svm_l
+plot(mod_svm_l$finalModel)
+
+
+# Train SVM Model Specify tuneLength instead of supplying a grid
+mod_svm_r <- train(dec ~ attr + prob, data = speed_dating_all, method = "svmRadial", preProc = c("center", "scale"), tuneLength = 15, trControl = cv_opts)
+mod_svm_r
+plot(mod_svm_r$finalModel)
+
+```
+
+*********************************************************************************
+
+The SVM classification plots show color gradient that indicates how confidently a new point would be classified based on its features, 'prob' and 'attr' in this case. The classes are denoted by circular and rectangular shapes. svmRadial does a better job of separating the two classes. The decision boundary is line in the svmLinear case whereas it is hyperplane for the svmRadial. It is easier to classify the classes in the svmRadial plot compared to the svmLinear plot. svmLinear = 0.7888172 & svmRadial = 0.7988172; thus, svmRadial model has the higher predictive accuracy among the two models, which also means that overall, radial basis kernel seems to be producing minimum misclassification error. 
+
+*********************************************************************************
+Let's fit a bagged classification trees model.  
+
+```{r}
+# Build Bagged Tree
+set.seed(3147)
+mod_bag_tree <- train(dec ~ ., data = speed_dating_all, method = "treebag", trControl = cv_opts)
+mod_bag_tree
+```
+
+*********************************************************************************
+
+The predictive accuracy rate of the bagged classification trees model is 0.7491398.
+
+*********************************************************************************
+
+Let's fit a random forest model.
+
+```{r}
+# Grid for hyper-parameter
+grd <- data.frame(.mtry = c(60:70*0.1))
+# Build Random Forest
+set.seed(3147)
+mod_rf <- train(dec ~ ., data = speed_dating_all, method = "rf", trControl = cv_opts,
+                tuneGrid = grd)
+plot(mod_rf)
+mod_rf
+
+```
+
+
+*********************************************************************************
+
+Function of the `mtry` hyper-parameter (6 in our case in the random forest model above): Number of variables available for splitting at each tree node. For classification models, the default is the square root of the number of predictor variables (rounded down).
+
+*********************************************************************************
+
+Which are the 5 most useful variables for the bagged trees?  What about for the random forest?  How do they compare?
+
+```{r}
+# Variable Importance Bagged Trees
+varImp(mod_bag_tree) 
+
+# Variable Importance Random Forest
+varImp(mod_rf)
+```
+
+
+*********************************************************************************
+
+5 most useful variables for the bagged trees:
+attr      100.000
+prob       80.085
+shar       75.284
+int_corr   69.929
+fun        52.440
+
+5 most useful variables for the random forest:
+attr      100.000
+int_corr   50.805
+prob       48.867
+shar       46.844
+fun        37.696
+
+Both bagged trees and random forest models pick out the same variables - 'attr', 'prob', 'shar', 'int_corr' and 'fun' - as the most useful predictors of whether a participant will get a second date or not. However, bagged trees give more importance to 'prob' and 'shar', 80.085 and 75.284 respectively. Compare this to the random forest model, which gives 'pro'b and 'shar' importance of 48.867 and 46.844. The 'attr' varible is by far the most important variable when it comes to prediction in both models. 
+
+*********************************************************************************
+
+Let's create a stacked ensemble model.
+
+```{r, eval = FALSE}
+# Note: Within the caretList, you can specify the models and tuning parameters with the following:
+# Make sure to first create the grids!
+
+set.seed(3147)
+speed_dating_final <- speed_dating_all %>%
+  mutate(dec = as.factor(ifelse(dec == 0, "no", "yes")))
+  
+# Set-up resampling options
+cv_opts <- trainControl(method = "cv", number = 10, savePredictions = "final", classProbs = TRUE, index = createFolds(speed_dating_final$dec))
+
+lam <- c(1:10/100)
+alpha <- c(90:95/100)
+grd_glmnet <- expand.grid(lambda = lam, alpha = alpha)
+
+C <- c(2:8/100)
+grd_svm <- data.frame(C)
+grd_rf <- data.frame(.mtry = c(20:35*0.01))
+# Build the models
+model_list <- caretList(dec ~ attr + prob, data = speed_dating_final, trControl = cv_opts, tuneList=list(
+    glmnet=caretModelSpec(method="glmnet", tuneGrid=grd_glmnet),
+    svm=caretModelSpec(method = "svmLinear", tuneGrid=grd_svm),
+    rf=caretModelSpec(method = "rf", tuneGrid=grd_rf)
+  ))
+
+# Correlation between models
+modelCor(resamples(model_list))
+
+#Look at a particular model
+model_list$glmnet
+model_list$svm
+model_list$rf
+
+#Look at the CV plot of a particular model
+plot(model_list$glmnet)
+plot(model_list$svm)
+plot(model_list$rf)
+
+# Set settings for stacking
+stackControl <- trainControl(method = "cv", number = 10, savePredictions = "final", classProbs = TRUE)
+
+mod_stack <- caretStack(model_list, metric = "Accuracy", trControl = stackControl, method = "glm")
+mod_stack
+```
+
